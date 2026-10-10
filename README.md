@@ -53,6 +53,27 @@ At 131,072 columns the online kernel is 3x faster than the fused one and 1.26x f
 ### Limitations
 
 Only fp32 is supported for now. Thresholds were measured on a T4 and may differ on other GPUs.
+
+## Tiled matmul
+
+`kernels/matmul.py` computes C = A @ B. Each program computes one `BLOCK_M x BLOCK_N` tile of C, walking along K in chunks of `BLOCK_K` and accumulating `tl.dot` results in fp32. Each loaded element of A is reused `BLOCK_N` times and each element of B `BLOCK_M` times, which is what makes the kernel compute bound rather than memory bound. Block sizes, `num_warps` and `num_stages` are chosen by `@triton.autotune`.
+
+### Results (NVIDIA T4, 4096 x 4096 x 4096, fp32)
+
+| Kernel | TFLOPS |
+|--------|-------:|
+| cuBLAS (`torch.matmul`) | 3.76 |
+| Triton, 32x32 tiles | 1.62 |
+| Triton, 64x64 tiles | 2.62 |
+| Triton, 128x128 tiles | 3.33 |
+| Triton, autotuned | 3.66 |
+
+The autotuned kernel reaches about 97% of cuBLAS. The winning config was 128x128x32 tiles with 8 warps and 3 pipeline stages. Across the configs tried, 8 warps beat 4 by about 9% at the same tile (64 accumulator values per thread instead of 128), and a `BLOCK_K` of 16 was the slowest since each loop iteration does too little work to cover its fixed overhead.
+
+### Note on fp16 and tensor cores on the T4
+
+In fp16, cuBLAS reaches 21.7 TFLOPS on the T4 using tensor cores, while this kernel only reaches about 1 TFLOPS. Inspecting the compiled PTX shows 0 `mma` (tensor core) instructions and 1024 `fma` instructions: with Triton 3.6 on a T4 (compute capability 7.5), `tl.dot` compiles to ordinary multiply and add rather than tensor core instructions. The fp32 comparison above is therefore the fair one on this GPU. On Ampere or newer GPUs (compute capability 8.0+) the same kernel should use tensor cores, and fp16 would become the fast path.
+
 ## Running
 
 Requires an NVIDIA GPU (Google Colab's free T4 works).
