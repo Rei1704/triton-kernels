@@ -74,6 +74,34 @@ The autotuned kernel reaches about 97% of cuBLAS. The winning config was 128x128
 
 In fp16, cuBLAS reaches 21.7 TFLOPS on the T4 using tensor cores, while this kernel only reaches about 1 TFLOPS. Inspecting the compiled PTX shows 0 `mma` (tensor core) instructions and 1024 `fma` instructions: with Triton 3.6 on a T4 (compute capability 7.5), `tl.dot` compiles to ordinary multiply and add rather than tensor core instructions. The fp32 comparison above is therefore the fair one on this GPU. On Ampere or newer GPUs (compute capability 8.0+) the same kernel should use tensor cores, and fp16 would become the fast path.
 
+## FlashAttention (forward)
+
+`kernels/attention.py` computes softmax(Q Kᵀ / √d) V without ever building the N x N score matrix. Each program takes a block of 32 query rows for one head and streams across the keys in blocks of 128. For each key block it computes that block's scores on chip, then updates a running max, a running sum, and a running weighted sum of V, rescaling the old values by `exp(m_old - m_new)` whenever the max grows. This is the online softmax from the wide row kernel above, extended to carry the output along with it. After the last block it divides by the running sum.
+
+Exponentials use `exp2` with log2(e) folded into the score scaling, as production FlashAttention kernels do. On the T4 this made no measurable difference, since the kernel is limited by the two matmuls rather than by exp.
+
+### Results (NVIDIA T4, fp32, 8 heads, head_dim 64)
+
+Compared against naive attention and PyTorch's memory efficient attention backend (`SDPBackend.EFFICIENT_ATTENTION`).
+
+| N | Naive | Mem efficient | Triton (this repo) |
+|------:|------:|------:|------:|
+| 8192 | 87.9 ms, 4.42 GB | 49.2 ms, 0.13 GB | 82.6 ms, 0.13 GB |
+| 16384 | out of memory | 197.1 ms, 0.20 GB | 333.2 ms, 0.20 GB |
+| 32768 | out of memory | 843.7 ms, 0.33 GB | 1358.7 ms, 0.33 GB |
+
+Memory matches PyTorch's memory efficient kernel exactly and grows linearly with N, while naive attention needs about 34x more at N = 8192 and cannot run at all beyond that on a 16 GB GPU. Runtime still grows with N² since the amount of computation is unchanged. Speed is about 60% of PyTorch's memory efficient kernel across all lengths.
+
+### What limits speed on the T4
+
+A sweep over block sizes, warps and pipeline stages showed every config with `BLOCK_M x BLOCK_N` of 8192 or more fails with `OutOfResources`. In fp32, a 64x128 P tile plus the V and K blocks it is multiplied with already exceed the T4's 64 KB of shared memory per SM. That caps the tiles at 32x128, so each K and V block is reused by only 32 query rows before being discarded, which limits math per byte loaded. Production FlashAttention runs in fp16 or bf16 on tensor cores, where tiles are half the size and the matmuls are far faster. Pipeline stages made no measurable difference for this kernel.
+
+Also worth noting: PyTorch's fused attention backends require 4D (batch, heads, N, d) inputs. With 3D inputs `scaled_dot_product_attention` silently falls back to its unfused math path, which on this GPU used as much memory as the naive version.
+
+### Limitations
+
+Forward pass only. fp32 only. Tested with head_dim 32 and 64; larger head dimensions would likely need smaller blocks to fit in shared memory.
+
 ## Running
 
 Requires an NVIDIA GPU (Google Colab's free T4 works).
